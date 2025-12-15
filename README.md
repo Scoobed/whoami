@@ -45,6 +45,19 @@ Heath check.
 - `GET`, `HEAD`, ...: returns a response with the status code defined by the `POST`
 - `POST`: changes the status code of the `GET` (`HEAD`, ...) response.
 
+#### `/ready`
+
+Readiness probe for Kubernetes.
+
+- Returns `200 OK` when the service is ready to accept traffic
+- Returns `503 Service Unavailable` when the service is shutting down
+
+#### `/alive`
+
+Liveness probe for Kubernetes.
+
+- Always returns `200 OK` to indicate the process is alive
+
 ### Flags
 
 | Flag      | Env var              | Description                             |
@@ -148,3 +161,39 @@ services:
        - --port=2001
        - --name=iamfoo
 ```
+
+## Graceful Shutdown
+
+The application implements graceful shutdown for zero-downtime deployments in Kubernetes:
+
+- **Signal Handling**: Listens for `SIGTERM` and `SIGINT` signals
+- **Request Tracking**: Tracks in-flight requests and waits for them to complete before shutting down
+- **Readiness Probe**: `/ready` endpoint returns 503 during shutdown to stop receiving new traffic
+- **Liveness Probe**: `/alive` endpoint always returns 200 to prevent premature pod termination
+
+### Kubernetes Deployment
+
+See `k8s-deployment.yaml` for a complete example with properly configured health checks and graceful shutdown.
+
+```console
+$ kubectl apply -f k8s-deployment.yaml
+
+# Test the deployment with zero downtime during rollout
+$ kubectl rollout restart deployment/whoami
+```
+
+### Testing Graceful Shutdown
+
+A test script is provided to verify graceful shutdown behavior:
+
+```console
+$ ./test-graceful-shutdown.sh
+```
+
+This script:
+1. Starts the whoami server
+2. Verifies liveness and readiness probes
+3. Starts a long-running request
+4. Sends SIGTERM during the request
+5. Confirms readiness probe returns 503
+6. Verifies the in-flight request completes successfully

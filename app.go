@@ -12,9 +12,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -50,6 +53,13 @@ var (
 	verbose bool
 )
 
+var (
+	// Track shutdown state for readiness probe
+	isShuttingDown atomic.Bool
+	// Track in-flight requests for graceful shutdown
+	inFlightRequests atomic.Int64
+)
+
 func init() {
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 	flag.StringVar(&cert, "cert", "", "give me a certificate")
@@ -81,33 +91,85 @@ func main() {
 	mux.Handle("/bench", handle(benchHandler, verbose))
 	mux.Handle("/api", handle(apiHandler, verbose))
 	mux.Handle("/health", handle(healthHandler, verbose))
+	mux.Handle("/ready", handle(readinessHandler, verbose))
+	mux.Handle("/alive", handle(livenessHandler, verbose))
 	mux.Handle("/", handle(whoamiHandler, verbose))
 
 	serverGRPC := grpc.NewServer()
 	grpcWhoami.RegisterWhoamiServer(serverGRPC, whoamiServer{})
 	mux.Handle("/whoami.Whoami/", serverGRPC)
 
-	h := handle(mux.ServeHTTP, verbose)
+	h := trackRequests(handle(mux.ServeHTTP, verbose))
+
+	var server *http.Server
 
 	if cert == "" || key == "" {
 		log.Printf("Starting up on port %s", port)
+		server = &http.Server{
+			Addr:    ":" + port,
+			Handler: h2c.NewHandler(h, &http2.Server{}),
+		}
+	} else {
+		server = &http.Server{
+			Addr:      ":" + port,
+			TLSConfig: &tls.Config{ClientAuth: tls.RequestClientCert},
+			Handler:   h,
+		}
 
-		log.Fatal(http.ListenAndServe(":"+port, h2c.NewHandler(h, &http2.Server{})))
+		if ca != "" {
+			server.TLSConfig = setupMutualTLS(ca)
+		}
+		log.Printf("Starting up with TLS on port %s", port)
 	}
 
-	server := &http.Server{
-		Addr:      ":" + port,
-		TLSConfig: &tls.Config{ClientAuth: tls.RequestClientCert},
-		Handler:   h,
+	// Set up channel for shutdown signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	go func() {
+		var err error
+		if cert == "" || key == "" {
+			err = server.ListenAndServe()
+		} else {
+			err = server.ListenAndServeTLS(cert, key)
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	log.Println("Server started successfully")
+
+	// Block until we receive a shutdown signal
+	<-stop
+	log.Println("Shutdown signal received")
+
+	// Step 1: Mark service as shutting down
+	isShuttingDown.Store(true)
+	log.Println("Marked as not ready")
+
+	// Step 2: Let Kubernetes notice the readiness probe failing
+	time.Sleep(5 * time.Second)
+	log.Println("Waited for readiness probe propagation")
+
+	// Step 3: Wait for in-flight requests to finish
+	log.Printf("Waiting for %d in-flight requests to complete", inFlightRequests.Load())
+	for inFlightRequests.Load() > 0 {
+		time.Sleep(1 * time.Second)
+		log.Printf("Still waiting for %d in-flight requests", inFlightRequests.Load())
+	}
+	log.Println("All in-flight requests completed")
+
+	// Step 4: Finally, shut down the server gracefully
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Forced shutdown: %v", err)
 	}
 
-	if ca != "" {
-		server.TLSConfig = setupMutualTLS(ca)
-	}
-
-	log.Printf("Starting up with TLS on port %s", port)
-
-	log.Fatal(server.ListenAndServeTLS(cert, key))
+	log.Println("Server gracefully stopped")
 }
 
 func setupMutualTLS(ca string) *tls.Config {
@@ -139,6 +201,23 @@ func handle(next http.HandlerFunc, verbose bool) http.Handler {
 
 		// <remote_IP_address> - [<timestamp>] "<request_method> <request_path> <request_protocol>" -
 		log.Printf("%s - - [%s] \"%s %s %s\" - -", r.RemoteAddr, time.Now().Format("02/Jan/2006:15:04:05 -0700"), r.Method, r.URL.Path, r.Proto)
+	})
+}
+
+// trackRequests wraps the handler to track in-flight requests for graceful shutdown
+func trackRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Don't track health check endpoints to avoid blocking shutdown
+		if r.URL.Path == "/ready" || r.URL.Path == "/alive" || r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Increment counter when request starts
+		inFlightRequests.Add(1)
+		defer inFlightRequests.Add(-1)
+
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -322,6 +401,25 @@ func healthHandler(w http.ResponseWriter, req *http.Request) {
 		defer mutexHealthState.RUnlock()
 		w.WriteHeader(currentHealthState.StatusCode)
 	}
+}
+
+// readinessHandler returns 503 when shutting down, 200 otherwise
+// This tells Kubernetes to stop sending new traffic during shutdown
+func readinessHandler(w http.ResponseWriter, _ *http.Request) {
+	if isShuttingDown.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprint(w, "Shutting down, not ready")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprint(w, "Ready for traffic")
+}
+
+// livenessHandler always returns 200 to indicate the process is alive
+// This prevents Kubernetes from killing the pod while it's gracefully shutting down
+func livenessHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprint(w, "I'm alive")
 }
 
 func getEnv(key, fallback string) string {
